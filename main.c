@@ -18,11 +18,15 @@
 
 //DEFINES
 
+//GM TUBE FACTOR CPM to uSv/h
+#define TUBE_FACTOR  57                       // uSv/h = 0.0057 * CPM
+
 //MCU PIN defines
-#define RED_LED BIT0                    //RED LED installed on PCB - used for debug
-#define GREEN_LED BIT6                  //GREEN LED installed on PCB - used for debug
-#define SWITCH  BIT3                    // BUTTON - USED FOR DEBUG
-#define UART_TX_PIN   BIT1              //SW UART TX LINE
+#define GM_INPUT      BIT4                    //INPUT FROM GM TUBE CATHODE
+#define RED_LED       BIT0                    //RED LED installed on PCB - used for debug
+#define GREEN_LED     BIT6                    //GREEN LED installed on PCB - used for debug
+#define SWITCH        BIT3                    //BUTTON - USED FOR DEBUG
+#define UART_TX_PIN   BIT1                    //SW UART TX LINE
 
 #define ENDLESS_LOOP()   while(1){}
 
@@ -30,9 +34,13 @@
 #define SEC_DELAY      512
 #define TEN_SEC_DELAY  (10U * SEC_DELAY)
 #define MINUTE_DELAY   (60U * SEC_DELAY)
+#define MINUTE          60U
 
 //Period of 1Bit for 9600 Baud SW UART, SMCLK = 1MHz
 #define UART_TBIT           (1000000 / 9600)
+
+#define ASCII_DIGIT_START    48
+#define MAX_NUMBER_DIGITS    5     // 5 digits for uint16 - max is 65535
 
 //GLOBALS
 uint16_t txData;    // UART internal variable for 1 byte payload. 1 byte payload = 10 bits total
@@ -55,18 +63,19 @@ void initPorts(void)
     P2SEL = BIT7 | BIT6;                            //SET PIN2.6 and PIN2.7 for 32Khz crystal
 
     //LED AND SWITCH INIT
-    P1DIR |= RED_LED | GREEN_LED |UART_TX_PIN;         // SET LED in output
-    P1OUT &= ~RED_LED & ~GREEN_LED;        //SET OUTPUT to 0
-    P1DIR &= ~SWITCH;    //SET input from button
-    P1REN |= SWITCH;      // enable pull-up/pull-down
-    P1OUT |= SWITCH;      // set usage of pull up
+    P1DIR |= RED_LED | GREEN_LED |UART_TX_PIN;         //SET LED in output
+    P1OUT &= ~RED_LED & ~GREEN_LED;                    //SET OUTPUT to 0
+    P1DIR &= ~SWITCH;                                  //SET input from button
+    P1DIR &= ~GM_INPUT;                                //SET input from GM_TUBE
+    P1REN |= SWITCH | GM_INPUT;                        //enable pull-up/pull-down on inputs
+    P1OUT |= SWITCH | GM_INPUT;                        //set usage of pull up
 
     //SET UART LINE TO IDLE in 1
     P1OUT |= UART_TX_PIN;
 
-    P1IES |= SWITCH;      //set interrupt on
-    P1IFG = 0;           //clear all pending interrupt flags
-    P1IE  |= SWITCH;      // enable interrupt on
+    P1IES |= SWITCH | GM_INPUT;      //set interrupt on
+    P1IFG = 0;                       //clear all pending interrupt flags
+    P1IE  |= SWITCH | GM_INPUT;      // enable interrupt on
 
 }
 
@@ -133,6 +142,19 @@ void TimerA_UART_print(char *string)
     }
 }
 
+void intToChars(const uint16_t *input, uint8_t *charArray  )
+{
+    uint16_t temp = *input;
+    uint8_t i=0;
+
+    for ( i=0; i<MAX_NUMBER_DIGITS; i++ )
+    {
+        charArray[MAX_NUMBER_DIGITS-1-i] = (uint8_t)(temp % 10u ) + ASCII_DIGIT_START;
+        temp = temp / 10;
+    }
+
+}
+
 void main(void)
 {
     WDTCTL = WDTPW | WDTHOLD;       // stop watchdog timer
@@ -147,31 +169,71 @@ void main(void)
 
     __bis_SR_register(GIE);         //enable global interrupt
 
+    uint16_t uSvPerHour=0;
+    uint8_t  uSvPerHourAscii[MAX_NUMBER_DIGITS+1] = {0, 0, 0, 0, 0, '\0'};
+    uint8_t  cpmAscii[MAX_NUMBER_DIGITS+1] = {0, 0, 0, 0, 0, '\0'};
+    uint8_t  counterAscii[MAX_NUMBER_DIGITS+1] = {0, 0, 0, 0, 0, '\0'};
+    uint8_t  secondsAscii[MAX_NUMBER_DIGITS+1] = {0, 0, 0, 0, 0, '\0'};
+
+    uint8_t has_send_data = 0;
+
     while(1)
     {
-        if( 2 == secCounter )
+
+        if(secCounter % 2U != 0)
         {
-            secCounter = 0;
+            has_send_data = 0;     // Prepare single sending
+        }
+
+
+        if(  (secCounter % 2U == 0) && has_send_data ==0 )
+        {
+
+            uSvPerHour = cpmCounter * TUBE_FACTOR;
+
+            intToChars(&cpmCounter, cpmAscii);
+            intToChars(&cpmCurrentCounter, counterAscii);
+            intToChars(&uSvPerHour, uSvPerHourAscii);
+            uint16_t secIn=secCounter;
+            intToChars(&secIn, secondsAscii);
+
+
             //TEST UART
-            TimerA_UART_print("GEIGER MULLER PROTOTYTPE REPORTING CPM : ");
-            TimerA_UART_tx( 0x30 + (uint8_t)cpmCurrentCounter  );
+            TimerA_UART_print("RELATIVE TIME = ");
+            TimerA_UART_print(secondsAscii);
+            TimerA_UART_print(" seconds, GEIGER MULLER PROTOTYTPE REPORTING CURRENT COUNTER = ");
+            TimerA_UART_print( counterAscii  );
+            TimerA_UART_print(", CPM = ");
+            TimerA_UART_print( cpmAscii  );
+            TimerA_UART_print(", uSv/h = ");
+            TimerA_UART_print(uSvPerHourAscii);
             TimerA_UART_print("\n\r");
+
+            has_send_data = 1;
         }
 
     }
 }
 
 
-// Interrupt routine for demonstrating the button when pressed the RED led is toggling
+// Interrupt routine handling aticle counting and button pressed
 #pragma vector=PORT1_VECTOR
-__interrupt void ISR_buttonPushed(void)
+__interrupt void ISR_portChange(void)
 {
-    cpmCurrentCounter++;      //increment counter - like hit from ionizing particle
+    // Particle detected
+    if(P1IFG & GM_INPUT)
+    {
+        cpmCurrentCounter++;
+        P1OUT ^= RED_LED;   //toggle RED
+        P1IFG &= ~GM_INPUT;
+    }
 
-    P1OUT ^= RED_LED;   //toggle led
-
-    P1IFG &= ~SWITCH; // clear interupt flag
-
+    //button pressed
+    if(P1IFG & SWITCH)
+    {
+       P1OUT ^= GREEN_LED;   //toggle GREEN led
+       P1IFG &= ~SWITCH; // clear interrupt flag
+    }
 
 }
 
@@ -208,13 +270,16 @@ __interrupt void ISR_Timer_A_expire (void)
 __interrupt void ISR_WDT_expire (void)
 {
     // Test code just toggle the LEDs
-    P1OUT ^= RED_LED | GREEN_LED;   //toggle led , no need to clean CCIFG it is automatically reset
-
-    //For testing  only
-    //cpmCounter = cpmCurrentCounter;
-    //cpmCurrentCounter = 0;
+    //P1OUT ^= RED_LED | GREEN_LED;   //toggle led , no need to clean CCIFG it is automatically reset
 
     secCounter++;              //increment perSecond counter
+
+    if( MINUTE == secCounter )
+    {
+        cpmCounter = cpmCurrentCounter;
+        cpmCurrentCounter = 0;
+        secCounter = 0;
+    }
 
 }
 
